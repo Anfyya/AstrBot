@@ -32,6 +32,7 @@ from astrbot.core.astr_main_agent_resources import (
 from astrbot.core.computer.booters.local import resolve_windows_shell
 from astrbot.core.conversation_mgr import Conversation
 from astrbot.core.db import BaseDatabase
+from astrbot.core.exceptions import ProviderRequestTooLargeError
 from astrbot.core.message.components import File, Image, Record, Reply, Video
 from astrbot.core.persona_error_reply import (
     extract_persona_custom_error_message_from_persona,
@@ -108,7 +109,12 @@ from astrbot.core.utils.astrbot_path import (
 )
 from astrbot.core.utils.file_extract import extract_file_moonshotai
 from astrbot.core.utils.llm_metadata import LLM_METADATAS
-from astrbot.core.utils.media_utils import is_file_uri, is_recoverable_image_error
+from astrbot.core.utils.media_utils import (
+    ImagePayloadTooLargeError,
+    get_image_preparation_options,
+    is_file_uri,
+    is_recoverable_image_error,
+)
 from astrbot.core.utils.quoted_message.settings import (
     SETTINGS as DEFAULT_QUOTED_MESSAGE_SETTINGS,
 )
@@ -726,7 +732,7 @@ async def _ensure_img_caption(
         caption = await _request_img_caption(
             image_caption_provider,
             cfg,
-            req.image_urls,
+            list(req.image_urls),
             plugin_context,
         )
         if caption:
@@ -734,6 +740,8 @@ async def _ensure_img_caption(
                 TextPart(text=f"<image_caption>{caption}</image_caption>")
             )
             req.image_urls = []
+    except (ImagePayloadTooLargeError, MemoryError, ProviderRequestTooLargeError):
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.error("处理图片描述失败: %s", exc)
         req.extra_user_content_parts.append(TextPart(text="[Image Captioning Failed]"))
@@ -888,8 +896,14 @@ async def _process_quote_message(
                         )
                 else:
                     logger.warning("No provider found for image captioning in quote.")
-            except Exception as exc:
-                logger.error("Quote image captioning failed (%s).", type(exc).__name__)
+            except (
+                ImagePayloadTooLargeError,
+                MemoryError,
+                ProviderRequestTooLargeError,
+            ):
+                raise
+            except BaseException as exc:
+                logger.error("处理引用图片失败: %s", exc)
 
     quoted_content = "\n".join(content_parts)
     quoted_text = f"<Quoted Message>\n{quoted_content}\n</Quoted Message>"
@@ -1729,6 +1743,11 @@ async def build_main_agent(
         req.system_prompt += f"\n{LIVE_MODE_SYSTEM_PROMPT}\n"
 
     _apply_web_search_citation_prompt(event, req)
+
+    if req.image_preparation_options is None:
+        req.image_preparation_options = get_image_preparation_options(
+            config.provider_settings
+        )
 
     reset_coro = agent_runner.reset(
         provider=provider,

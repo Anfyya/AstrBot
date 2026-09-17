@@ -7,6 +7,7 @@ probing, and image compression helpers.
 import asyncio
 import base64
 import binascii
+import ctypes
 import errno
 import hashlib
 import io
@@ -27,7 +28,7 @@ from urllib.request import url2pathname
 
 from aiohttp import ClientError
 from PIL import Image as PILImage
-from PIL import ImageOps
+from PIL import ImageOps, UnidentifiedImageError
 
 from astrbot import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
@@ -47,6 +48,461 @@ MODEL_IMAGE_MAX_INPUT_BYTES = 32 * 1024 * 1024
 # Original encoded bytes are reused only for small stills; larger inputs are
 # re-encoded so the output stays bounded by pixel size and quality.
 MODEL_IMAGE_REUSE_MAX_BYTES = 2 * 1024 * 1024
+IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES = 4 * 1024 * 1024
+
+_WEBP_PRESERVE = object()
+_WEBP_DECODER = None
+_WEBP_DECODER_UNAVAILABLE = False
+_WEBP_ADVANCED_DECODER_AVAILABLE = False
+_WEBP_DECODER_ABI_VERSION = 0x0210
+
+
+class _WebPRgbaBuffer(ctypes.Structure):
+    """ctypes view of libwebp's externally-owned packed pixel buffer."""
+
+    _fields_ = [
+        ("rgba", ctypes.POINTER(ctypes.c_ubyte)),
+        ("stride", ctypes.c_int),
+        ("size", ctypes.c_size_t),
+    ]
+
+
+class _WebPYuvaBuffer(ctypes.Structure):
+    """ctypes view of libwebp's YUVA buffer union arm."""
+
+    _fields_ = [
+        ("y", ctypes.POINTER(ctypes.c_ubyte)),
+        ("u", ctypes.POINTER(ctypes.c_ubyte)),
+        ("v", ctypes.POINTER(ctypes.c_ubyte)),
+        ("a", ctypes.POINTER(ctypes.c_ubyte)),
+        ("y_stride", ctypes.c_int),
+        ("u_stride", ctypes.c_int),
+        ("v_stride", ctypes.c_int),
+        ("a_stride", ctypes.c_int),
+        ("y_size", ctypes.c_size_t),
+        ("u_size", ctypes.c_size_t),
+        ("v_size", ctypes.c_size_t),
+        ("a_size", ctypes.c_size_t),
+    ]
+
+
+class _WebPBufferUnion(ctypes.Union):
+    """ctypes view of libwebp's decoded buffer union."""
+
+    _fields_ = [
+        ("rgba", _WebPRgbaBuffer),
+        ("yuva", _WebPYuvaBuffer),
+    ]
+
+
+class _WebPDecBuffer(ctypes.Structure):
+    """ctypes view of libwebp's decoder output descriptor."""
+
+    _fields_ = [
+        ("colorspace", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("is_external_memory", ctypes.c_int),
+        ("u", _WebPBufferUnion),
+        ("pad", ctypes.c_uint32 * 4),
+        ("private_memory", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+class _WebPBitstreamFeatures(ctypes.Structure):
+    """ctypes view of libwebp's bitstream feature structure."""
+
+    _fields_ = [
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("has_alpha", ctypes.c_int),
+        ("has_animation", ctypes.c_int),
+        ("format", ctypes.c_int),
+        ("pad", ctypes.c_uint32 * 5),
+    ]
+
+
+class _WebPDecoderOptions(ctypes.Structure):
+    """ctypes view of libwebp's decoder options structure."""
+
+    _fields_ = [
+        (name, ctypes.c_int)
+        for name in (
+            "bypass_filtering",
+            "no_fancy_upsampling",
+            "use_cropping",
+            "crop_left",
+            "crop_top",
+            "crop_width",
+            "crop_height",
+            "use_scaling",
+            "scaled_width",
+            "scaled_height",
+            "use_threads",
+            "dithering_strength",
+            "flip",
+            "alpha_dithering_strength",
+        )
+    ] + [("pad", ctypes.c_uint32 * 5)]
+
+
+class _WebPDecoderConfig(ctypes.Structure):
+    """ctypes view of libwebp's advanced decoder configuration."""
+
+    _fields_ = [
+        ("input", _WebPBitstreamFeatures),
+        ("output", _WebPDecBuffer),
+        ("options", _WebPDecoderOptions),
+    ]
+
+
+class ImagePayloadTooLargeError(ValueError):
+    """Raised when an encoded image cannot fit the preparation budget."""
+
+
+def _get_webp_decoder():
+    """Load the decoder already shipped with Pillow when it exposes C APIs.
+
+    Returns:
+        A configured ctypes library, or ``None`` when the Pillow build does
+        not expose the decoder symbols.
+    """
+    global _WEBP_ADVANCED_DECODER_AVAILABLE
+    global _WEBP_DECODER, _WEBP_DECODER_UNAVAILABLE
+    if _WEBP_DECODER_UNAVAILABLE:
+        return None
+    if _WEBP_DECODER is not None:
+        return _WEBP_DECODER
+    try:
+        from PIL import _webp
+
+        decoder = ctypes.CDLL(_webp.__file__)
+        get_info = decoder.WebPGetInfo
+        decode_rgb = decoder.WebPDecodeRGBInto
+        decode_rgba = decoder.WebPDecodeRGBAInto
+        get_info.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        get_info.restype = ctypes.c_int
+        for decode in (decode_rgb, decode_rgba):
+            decode.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            decode.restype = ctypes.c_void_p
+    except (AttributeError, ImportError, OSError):
+        _WEBP_DECODER_UNAVAILABLE = True
+        return None
+    try:
+        init_config = decoder.WebPInitDecoderConfigInternal
+        decode = decoder.WebPDecode
+        free_buffer = decoder.WebPFreeDecBuffer
+        init_config.argtypes = [
+            ctypes.POINTER(_WebPDecoderConfig),
+            ctypes.c_int,
+        ]
+        init_config.restype = ctypes.c_int
+        decode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(_WebPDecoderConfig),
+        ]
+        decode.restype = ctypes.c_int
+        free_buffer.argtypes = [ctypes.POINTER(_WebPDecBuffer)]
+        free_buffer.restype = None
+    except AttributeError:
+        _WEBP_ADVANCED_DECODER_AVAILABLE = False
+    else:
+        _WEBP_ADVANCED_DECODER_AVAILABLE = True
+    _WEBP_DECODER = decoder
+    return decoder
+
+
+def _webp_container_properties(
+    data: bytes,
+) -> tuple[int, int, bool, bool, bool] | None:
+    """Read WebP dimensions and flags without constructing a Pillow decoder.
+
+    Args:
+        data: Complete WebP file bytes.
+
+    Returns:
+        Width, height, alpha flag, animation flag, and EXIF flag.
+        ``None`` when the container needs the optional decoder to expose its
+        dimensions and that decoder is unavailable.
+
+    Raises:
+        ValueError: The RIFF/WebP container is malformed.
+    """
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        raise ValueError("invalid WebP container")
+    width = height = None
+    has_alpha = False
+    has_animation = False
+    has_exif = False
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_type = data[offset : offset + 4]
+        chunk_size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        start = offset + 8
+        end = start + chunk_size
+        if end > len(data):
+            raise ValueError("truncated WebP chunk")
+        chunk = data[start:end]
+        if chunk_type == b"VP8X" and len(chunk) >= 10:
+            has_alpha = bool(chunk[0] & 0x10)
+            has_animation = bool(chunk[0] & 0x02)
+            width = 1 + int.from_bytes(chunk[4:7] + b"\0", "little")
+            height = 1 + int.from_bytes(chunk[7:10] + b"\0", "little")
+        elif chunk_type in {b"ANIM", b"ANMF"}:
+            has_animation = True
+        elif chunk_type == b"ALPH":
+            has_alpha = True
+        elif chunk_type == b"EXIF":
+            has_exif = True
+        elif chunk_type == b"VP8L" and len(chunk) >= 5 and chunk[0] == 0x2F:
+            has_alpha = has_alpha or bool(
+                int.from_bytes(chunk[1:5], "little") & (1 << 28)
+            )
+        offset = end + (chunk_size & 1)
+    if width is None or height is None:
+        decoder = _get_webp_decoder()
+        if decoder is None:
+            return None
+        get_info = decoder.WebPGetInfo
+        width_value, height_value = ctypes.c_int(), ctypes.c_int()
+        if not get_info(
+            ctypes.c_char_p(data),
+            len(data),
+            ctypes.byref(width_value),
+            ctypes.byref(height_value),
+        ):
+            raise ValueError("invalid WebP bitstream")
+        width, height = width_value.value, height_value.value
+    return width, height, has_alpha, has_animation, has_exif
+
+
+def _decode_webp_with_advanced_config(
+    decoder,
+    data: bytes,
+    width: int,
+    height: int,
+    target: tuple[int, int],
+    has_alpha: bool,
+):
+    """Decode a scaled static WebP into one caller-owned pixel buffer.
+
+    Args:
+        decoder: Configured libwebp shared library.
+        data: Complete encoded WebP bytes.
+        width: Original image width.
+        height: Original image height.
+        target: Requested output dimensions.
+        has_alpha: Whether the decoded image needs an alpha channel.
+
+    Returns:
+        A Pillow image when the advanced ABI is available and decoding succeeds;
+        otherwise ``None`` so the caller can use the basic decoder path.
+
+    Raises:
+        MemoryError: The caller-owned output buffer cannot be allocated.
+    """
+    if not _WEBP_ADVANCED_DECODER_AVAILABLE or target == (width, height):
+        return None
+
+    channels = 4 if has_alpha else 3
+    mode = "RGBA" if has_alpha else "RGB"
+    pixels = bytearray(target[0] * target[1] * channels)
+    pixel_buffer = (ctypes.c_ubyte * len(pixels)).from_buffer(pixels)
+    config = _WebPDecoderConfig()
+    if not decoder.WebPInitDecoderConfigInternal(
+        ctypes.byref(config), _WEBP_DECODER_ABI_VERSION
+    ):
+        return None
+    config.output.colorspace = 1 if has_alpha else 0
+    config.output.is_external_memory = 1
+    config.output.u.rgba.rgba = ctypes.cast(
+        pixel_buffer, ctypes.POINTER(ctypes.c_ubyte)
+    )
+    config.output.u.rgba.stride = target[0] * channels
+    config.output.u.rgba.size = len(pixels)
+    config.options.use_scaling = 1
+    config.options.scaled_width, config.options.scaled_height = target
+    try:
+        if (
+            decoder.WebPDecode(ctypes.c_char_p(data), len(data), ctypes.byref(config))
+            != 0
+        ):
+            return None
+        if (config.output.width, config.output.height) != target:
+            return None
+    finally:
+        decoder.WebPFreeDecBuffer(ctypes.byref(config.output))
+    del pixel_buffer
+    image = PILImage.frombuffer(mode, target, pixels, "raw", mode, 0, 1)
+    image.format = "WEBP"
+    return image
+
+
+def _open_static_webp(
+    source: bytes | Path,
+    max_size: int,
+    max_encoded_bytes: int,
+    *,
+    preserve_dimensions: bool = False,
+):
+    """Decode static WebP directly into one caller-owned pixel buffer.
+
+    Args:
+        source: Encoded WebP bytes or a local WebP path.
+        max_size: Maximum edge length for the eventual preparation step.
+        max_encoded_bytes: Base64 payload budget.
+        preserve_dimensions: Whether the eventual preparation step must retain
+            the original dimensions.
+
+    Returns:
+        A Pillow image backed by one RGB/RGBA buffer, ``_WEBP_PRESERVE`` for a
+        compliant image, or ``None`` to use Pillow's compatibility path.
+
+    Raises:
+        ImagePayloadTooLargeError: An animation already exceeds the budget.
+        ValueError: The WebP container is invalid.
+        MemoryError: The target pixel buffer cannot be allocated.
+    """
+    data = source if isinstance(source, bytes) else source.read_bytes()
+    try:
+        properties = _webp_container_properties(data)
+    except ValueError:
+        return None
+    if properties is None:
+        return None
+    width, height, has_alpha, has_animation, has_exif = properties
+    PILImage._decompression_bomb_check((width, height))
+    encoded_size = 4 * ((len(data) + 2) // 3)
+    if has_animation:
+        if encoded_size > max_encoded_bytes:
+            raise ImagePayloadTooLargeError(
+                f"Animated image exceeds the {max_encoded_bytes}-byte encoding limit"
+            )
+        return _WEBP_PRESERVE
+    if encoded_size <= max_encoded_bytes and (
+        preserve_dimensions or max(width, height) <= max_size
+    ):
+        return _WEBP_PRESERVE
+    # The direct route cannot carry EXIF orientation without loading Pillow's
+    # normal WebP plugin. Keep correctness for metadata-bearing images.
+    if has_exif:
+        return None
+    decoder = _get_webp_decoder()
+    if decoder is None:
+        return None
+    target = (width, height)
+    if not preserve_dimensions:
+        if max(width, height) > max_size:
+            scale = max_size / max(width, height)
+            target = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            )
+        elif encoded_size > max_encoded_bytes * 2 and max(width, height) >= max_size:
+            target = (
+                max(1, width * 3 // 4),
+                max(1, height * 3 // 4),
+            )
+    scaled = _decode_webp_with_advanced_config(
+        decoder,
+        data,
+        width,
+        height,
+        target,
+        has_alpha,
+    )
+    if scaled is not None:
+        del data
+        return scaled
+
+    channels = 4 if has_alpha else 3
+    pixels = bytearray(width * height * channels)
+    pixel_buffer = (ctypes.c_ubyte * len(pixels)).from_buffer(pixels)
+    decode = decoder.WebPDecodeRGBAInto if has_alpha else decoder.WebPDecodeRGBInto
+    if not decode(
+        ctypes.c_char_p(data),
+        len(data),
+        pixel_buffer,
+        len(pixels),
+        width * channels,
+    ):
+        raise ValueError("invalid WebP bitstream")
+    del pixel_buffer, data
+    mode = "RGBA" if has_alpha else "RGB"
+    image = PILImage.frombuffer(mode, (width, height), pixels, "raw", mode, 0, 1)
+    image.format = "WEBP"
+    return image
+
+
+@dataclass(slots=True)
+class ImagePreparationOptions:
+    """Options for the single provider-facing image preparation boundary."""
+
+    enabled: bool = True
+    max_size: int = IMAGE_COMPRESS_DEFAULT_MAX_SIZE
+    quality: int = IMAGE_COMPRESS_DEFAULT_QUALITY
+    optimize: bool = IMAGE_COMPRESS_DEFAULT_OPTIMIZE
+    max_encoded_bytes: int | None = IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES
+    preserve_dimensions: bool = False
+
+
+def get_image_preparation_options(
+    provider_settings: dict | None,
+) -> ImagePreparationOptions:
+    """Build image preparation options from provider settings.
+
+    Args:
+        provider_settings: Provider-level image preparation configuration.
+
+    Returns:
+        Validated image preparation options using the standard defaults.
+    """
+    if not isinstance(provider_settings, dict):
+        return ImagePreparationOptions()
+
+    enabled = provider_settings.get("image_compress_enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = True
+    raw_options = provider_settings.get("image_compress_options", {})
+    options = raw_options if isinstance(raw_options, dict) else {}
+
+    max_size = options.get("max_size", IMAGE_COMPRESS_DEFAULT_MAX_SIZE)
+    if not isinstance(max_size, int) or isinstance(max_size, bool):
+        max_size = IMAGE_COMPRESS_DEFAULT_MAX_SIZE
+
+    quality = options.get("quality", IMAGE_COMPRESS_DEFAULT_QUALITY)
+    if not isinstance(quality, int) or isinstance(quality, bool):
+        quality = IMAGE_COMPRESS_DEFAULT_QUALITY
+
+    max_encoded_bytes = options.get(
+        "max_encoded_bytes", IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES
+    )
+    if not isinstance(max_encoded_bytes, int) or isinstance(max_encoded_bytes, bool):
+        max_encoded_bytes = IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES
+    optimize = options.get("optimize", IMAGE_COMPRESS_DEFAULT_OPTIMIZE)
+    if not isinstance(optimize, bool):
+        optimize = IMAGE_COMPRESS_DEFAULT_OPTIMIZE
+
+    return ImagePreparationOptions(
+        enabled=enabled,
+        max_size=max(max_size, 1),
+        quality=min(max(quality, 1), 100),
+        optimize=optimize,
+        max_encoded_bytes=max(max_encoded_bytes, 1),
+    )
+
 
 MEDIA_MIME_EXTENSIONS = {
     "audio/wav": ".wav",
@@ -125,6 +581,22 @@ Examples:
 """
 
 
+@dataclass(frozen=True, slots=True)
+class ImagePreparationInput:
+    """Describe an image entering the shared preparation boundary.
+
+    Args:
+        value: Image path, URL, data URI, base64 reference, or raw bytes.
+        source_kind: Logical producer used for diagnostics and experiments.
+        cleanup_paths: Temporary paths owned by the caller and released after
+            preparation finishes.
+    """
+
+    value: MediaRefStr | bytes
+    source_kind: str = "unknown"
+    cleanup_paths: tuple[Path, ...] = ()
+
+
 @dataclass(slots=True)
 class ResolvedMediaData:
     """Base64 media bytes plus the metadata needed by provider payloads.
@@ -138,6 +610,7 @@ class ResolvedMediaData:
     base64_data: str
     mime_type: str
     format: str | None = None
+    byte_size: int | None = None
 
     def to_bytes(self) -> bytes:
         """Decode the base64 payload, accepting missing padding."""
@@ -180,7 +653,7 @@ class ResolvedMediaFile:
 
     def to_base64(self) -> str:
         """Read the resolved local file and return raw base64 data."""
-        return base64.b64encode(self.read_bytes()).decode("utf-8")
+        return _encode_file_to_base64(self.path)
 
     def to_data_url(self) -> str:
         """Read the resolved local file and return a data URL."""
@@ -325,6 +798,39 @@ def _decode_base64_payload(
         return base64.b64decode(payload, validate=validate)
     except (binascii.Error, ValueError) as exc:
         raise ValueError(error_message) from exc
+
+
+def _encode_file_to_base64(path: Path) -> str:
+    """Encode a file without retaining a second full raw-image copy.
+
+    Args:
+        path: Local file to read.
+
+    Returns:
+        Base64 text without a data-URI prefix or line breaks.
+
+    Raises:
+        OSError: The file cannot be opened or read.
+    """
+    encoded = io.StringIO()
+    remainder = b""
+    chunk = b""
+    block = b""
+    chunk_size = 1023 * 1024
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            block = remainder + chunk if remainder else chunk
+            complete_size = len(block) - len(block) % 3
+            if complete_size:
+                encoded.write(base64.b64encode(block[:complete_size]).decode("ascii"))
+            remainder = block[complete_size:]
+    del chunk, block
+    if remainder:
+        encoded.write(base64.b64encode(remainder).decode("ascii"))
+    return encoded.getvalue()
 
 
 def describe_media_ref(media_ref: object | None) -> str:
@@ -916,29 +1422,89 @@ class MediaResolver:
 
 
 async def resolve_image_ref_to_base64_data(
-    image_ref: MediaRefStr,
+    image_ref: MediaRefStr | bytes,
     *,
     strict: bool = False,
     default_mime_type: str | None = "image/jpeg",
+    options: ImagePreparationOptions | None = None,
 ) -> ResolvedMediaData | None:
-    """Resolve an image reference to losslessly encoded base64 data.
+    """Resolve and prepare an image reference for a provider request.
 
-    Only materializes the source and detects its MIME type; no
-    provider-specific format conversion, frame extraction, or montage is
-    performed here. Platform senders and generic request assembly rely on
-    this to encode image bytes without transforming their content.
+    ``strict=False`` returns ``None`` for invalid images so provider payload
+    assembly can skip bad image refs without failing the whole request. Resource
+    and size-limit errors still propagate because returning the original image
+    would allow an invalid or oversized payload to reach a provider.
 
-    ``strict=False`` returns ``None`` for invalid images so payload
-    assembly can skip bad image refs without failing the whole request.
+    Args:
+        image_ref: Local path, URL, data URI, base64 reference, or image bytes.
+        strict: Raise ordinary resolution errors instead of returning ``None``.
+        default_mime_type: MIME fallback for otherwise unidentified images.
+        options: Dimension, encoding, and cleanup policy for image preparation.
+
+    Returns:
+        Prepared provider-ready image data, or ``None`` for a safely skippable
+        invalid image when ``strict`` is false.
+
+    Raises:
+        ImagePayloadTooLargeError: The image cannot fit the configured budget.
+        MemoryError: Image preparation exhausts process resources.
+        OSError: The source cannot be read or the prepared output cannot be written.
     """
-    return await MediaResolver(
-        image_ref,
-        media_type="image",
-        default_suffix=".bin",
-    ).to_base64_data(
-        strict=strict,
-        default_mime_type=default_mime_type,
-    )
+    try:
+        return await prepare_image_source(
+            image_ref,
+            options=options,
+            default_mime_type=default_mime_type,
+        )
+    except (ImagePayloadTooLargeError, MemoryError):
+        raise
+    except (OSError, ValueError):
+        is_legacy_base64 = isinstance(image_ref, str) and image_ref.startswith(
+            "base64://"
+        )
+        if isinstance(image_ref, str) and not is_legacy_base64:
+            is_reference_scheme = image_ref.startswith(
+                ("http://", "https://", "data:")
+            ) or is_file_uri(image_ref)
+            try:
+                path_exists = Path(image_ref).exists()
+            except OSError:
+                path_exists = False
+            if not is_reference_scheme and not path_exists:
+                try:
+                    _decode_base64_payload(
+                        "".join(image_ref.split()),
+                        error_message="invalid bare base64 media payload",
+                        validate=True,
+                    )
+                except ValueError:
+                    pass
+                else:
+                    is_legacy_base64 = True
+        if is_legacy_base64:
+            # Preserve the historical fallback for opaque legacy base64 refs,
+            # while still enforcing the configured request budget.
+            legacy = await MediaResolver(
+                image_ref,
+                media_type="image",
+                default_suffix=".bin",
+            ).to_base64_data(
+                strict=strict,
+                default_mime_type=default_mime_type,
+            )
+            if (
+                legacy
+                and options
+                and options.max_encoded_bytes is not None
+                and len(legacy.base64_data) > options.max_encoded_bytes
+            ):
+                raise ImagePayloadTooLargeError(
+                    f"Image exceeds the {options.max_encoded_bytes}-byte encoding limit"
+                )
+            return legacy
+        if strict:
+            raise
+        return None
 
 
 def _image_convert_cache_dir() -> Path:
@@ -1467,10 +2033,12 @@ async def resolve_audio_ref_to_base64_data(
 
 
 async def resolve_media_ref_to_base64_data(
-    media_ref: MediaRefStr,
+    media_ref: MediaRefStr | bytes,
     *,
     media_type: str,
     strict: bool = False,
+    image_options: ImagePreparationOptions | None = None,
+    default_mime_type: str | None = "image/jpeg",
 ) -> ResolvedMediaData | None:
     """Resolve a media reference to base64 data through one shared entrypoint.
 
@@ -1479,7 +2047,12 @@ async def resolve_media_ref_to_base64_data(
     """
 
     if media_type == "image":
-        return await resolve_image_ref_to_base64_data(media_ref, strict=strict)
+        return await resolve_image_ref_to_base64_data(
+            media_ref,
+            strict=strict,
+            default_mime_type=default_mime_type,
+            options=image_options,
+        )
     if media_type == "audio":
         return await resolve_audio_ref_to_base64_data(media_ref)
 
@@ -2023,134 +2596,444 @@ async def extract_video_cover(
         raise Exception("ffmpeg not found")
 
 
+def _resize_alpha_in_strips(
+    source: PILImage.Image, size: tuple[int, int]
+) -> PILImage.Image:
+    """Resize transparency with bounded premultiplication buffers.
+
+    Pillow premultiplies a complete RGBA image before filtering. Processing
+    overlapping strips keeps those temporary buffers proportional to width,
+    while retaining the Lanczos support around each output strip.
+
+    Args:
+        source: Caller-owned image with an alpha channel.
+        size: Output dimensions.
+
+    Returns:
+        A caller-owned resized image.
+
+    Raises:
+        OSError: Pixel decoding or resizing fails.
+        MemoryError: Output or temporary pixel allocation fails.
+    """
+    output = PILImage.new(source.mode, size)
+    try:
+        ratio = source.height / size[1]
+        halo = math.ceil(3 * max(1, ratio)) + 1
+        # Align strip boundaries with source rows whenever the rational scale
+        # permits it, avoiding floating-point phase changes at those boundaries.
+        alignment = size[1] // math.gcd(source.height, size[1])
+        strip_height = max(alignment, 32 // alignment * alignment)
+        if strip_height > 64:
+            strip_height = 32
+        for top in range(0, size[1], strip_height):
+            bottom = min(top + strip_height, size[1])
+            start = max(0, math.floor(top * ratio) - halo)
+            end = min(source.height, math.ceil(bottom * ratio) + halo)
+            with source.crop((0, start, source.width, end)) as strip:
+                with strip.resize(
+                    (size[0], bottom - top),
+                    PILImage.Resampling.LANCZOS,
+                    box=(0, top * ratio - start, source.width, bottom * ratio - start),
+                ) as resized:
+                    output.paste(resized, (0, top))
+        return output
+    except BaseException:
+        output.close()
+        raise
+
+
 def _compress_image_sync(
     source: bytes | Path,
     temp_dir: Path,
     max_size: int,
     quality: int,
     optimize: bool,
+    max_encoded_bytes: int = IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES,
+    *,
+    preserve_dimensions: bool = False,
 ) -> str | None:
-    """Run image compression synchronously via ``asyncio.to_thread``.
+    """Prepare one image without allocating base64 for candidate measurements.
 
     Args:
-        source: Encoded image bytes or a local path to open inside the worker.
-        temp_dir: Directory where the compressed image should be written.
-        max_size: Longest edge of the compressed image in pixels.
-        quality: JPEG output quality in the range 1-100.
-        optimize: Whether Pillow should optimize the saved image.
+        source: Encoded bytes or a local file opened inside the worker.
+        temp_dir: Directory for the caller-owned prepared file.
+        max_size: Maximum edge length when resizing is allowed.
+        quality: Initial JPEG quality, between 1 and 100.
+        optimize: Whether to optimize the encoder output.
+        max_encoded_bytes: Maximum base64 payload size, excluding its URI header.
+        preserve_dimensions: Preserve screenshot coordinates, even over max_size.
 
     Returns:
-        The compressed image path, or ``None`` when the image should be kept as-is.
+        A caller-owned output path, or None to preserve the original bytes.
+
+    Raises:
+        ImagePayloadTooLargeError: No candidate meets the encoded-byte budget.
+        ValueError: A size or quality option is invalid.
+        OSError: Reading, decoding or writing the image fails.
     """
+    if max_size < 1 or max_encoded_bytes < 1 or not 1 <= quality <= 100:
+        raise ValueError("Image dimensions, byte budget and quality must be positive")
+    source_bytes = len(source) if isinstance(source, bytes) else source.stat().st_size
+    encoded_size = 4 * ((source_bytes + 2) // 3)
+    direct_webp = None
+    if isinstance(source, bytes):
+        is_webp = source[:4] == b"RIFF" and source[8:12] == b"WEBP"
+    else:
+        with source.open("rb") as source_stream:
+            header = source_stream.read(12)
+        is_webp = (
+            len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+        )
+    if is_webp:
+        direct_webp = _open_static_webp(
+            source,
+            max_size,
+            max_encoded_bytes,
+            preserve_dimensions=preserve_dimensions,
+        )
+        if direct_webp is _WEBP_PRESERVE:
+            return None
     fp = io.BytesIO(source) if isinstance(source, bytes) else source
-    with PILImage.open(fp) as opened_img:
-        converted_img: PILImage.Image | None = None
+    opened = direct_webp if direct_webp is not None else PILImage.open(fp)
+    with opened:
+        animated = getattr(opened, "n_frames", 1) > 1
+        # This baseline preserves animation; do not flatten it to fit a budget.
+        if animated:
+            if encoded_size > max_encoded_bytes:
+                raise ImagePayloadTooLargeError(
+                    f"Animated image exceeds the {max_encoded_bytes}-byte encoding limit"
+                )
+            return None
+        if encoded_size <= max_encoded_bytes and (
+            preserve_dimensions or max(opened.size) <= max_size
+        ):
+            return None
 
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        path: Path | None = None
+        best_size: int | None = None
+        success = False
+        # Resize before EXIF handling loads the pixels. JPEG thumbnailing can
+        # then use decoder-level downsampling instead of a full-size RGB buffer.
+        # A square bound is unchanged by EXIF rotations and reflections.
+        if (
+            opened.format == "JPEG"
+            and not preserve_dimensions
+            and max(opened.size) > max_size
+        ):
+            opened.thumbnail(
+                (max_size, max_size), PILImage.Resampling.LANCZOS, reducing_gap=1.0
+            )
+        # In-place orientation avoids holding a second full oriented image.
+        ImageOps.exif_transpose(opened, in_place=True)
+        has_alpha = opened.mode in {"RGBA", "LA"} or (
+            opened.mode == "P" and "transparency" in opened.info
+        )
+        target_mode = "RGBA" if has_alpha else "RGB"
+        converted = opened.convert(target_mode) if opened.mode != target_mode else None
+        working = converted if converted is not None else opened
         try:
-            if (
-                getattr(opened_img, "is_animated", False)
-                or getattr(opened_img, "n_frames", 1) > 1
-            ):
-                return None
-
-            working_img = opened_img
-            image_has_alpha = opened_img.mode in {"RGBA", "LA"} or (
-                opened_img.mode == "P" and "transparency" in opened_img.info
+            if not preserve_dimensions and max(working.size) > max_size:
+                working.thumbnail((max_size, max_size), PILImage.Resampling.LANCZOS)
+            qualities = (
+                [quality]
+                if has_alpha
+                else sorted(
+                    {
+                        quality,
+                        *[value for value in (85, 70, 55, 40) if value < quality],
+                    },
+                    reverse=True,
+                )
             )
-            output_format = "PNG" if image_has_alpha else "JPEG"
-            output_suffix = ".png" if image_has_alpha else ".jpg"
-
-            if image_has_alpha and opened_img.mode != "RGBA":
-                converted_img = opened_img.convert("RGBA")
-                working_img = converted_img
-            elif not image_has_alpha and opened_img.mode != "RGB":
-                converted_img = opened_img.convert("RGB")
-                working_img = converted_img
-            assert working_img is not None
-
-            if max(working_img.size) > max_size:
-                working_img.thumbnail((max_size, max_size), PILImage.Resampling.LANCZOS)
-
-            save_path = (
-                temp_dir / f"compressed_{generate_timestamp_id()}{output_suffix}"
+            source_format = str(opened.format or "").upper()
+            # If the encoded source is already more than twice the budget, a
+            # same-size candidate cannot be a useful memory-saving first step.
+            # Resize once before encoding so the source pixels and encoder
+            # buffers are not resident together at the original dimensions.
+            skip_current_candidate = (
+                not preserve_dimensions
+                and encoded_size > max_encoded_bytes * 2
+                and max(working.size) >= max_size
             )
-            save_kwargs: dict[str, int | bool] = {"optimize": optimize}
-            if output_format == "JPEG":
-                save_kwargs["quality"] = quality
-            working_img.save(save_path, output_format, **save_kwargs)
-            logger.debug(f"Image compressed successfully: {save_path}")
-            return str(save_path)
+            while True:
+                if not skip_current_candidate:
+                    if has_alpha:
+                        formats = [("PNG", ".png", None)]
+                    else:
+                        formats = (
+                            [("PNG", ".png", None)] if source_format == "PNG" else []
+                        ) + [
+                            ("JPEG", ".jpg", candidate_quality)
+                            for candidate_quality in qualities
+                        ]
+                    for output_format, suffix, candidate_quality in formats:
+                        candidate_path: Path | None = None
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                dir=temp_dir,
+                                prefix="compressed_",
+                                suffix=suffix,
+                                delete=False,
+                            ) as output:
+                                candidate_path = Path(output.name)
+                            kwargs = {"optimize": optimize}
+                            if candidate_quality is not None:
+                                kwargs["quality"] = candidate_quality
+                            working.save(candidate_path, output_format, **kwargs)
+                            candidate_size = candidate_path.stat().st_size
+                            encoded_size = 4 * ((candidate_size + 2) // 3)
+                            if encoded_size <= max_encoded_bytes and (
+                                best_size is None or candidate_size < best_size
+                            ):
+                                if path is not None:
+                                    path.unlink(missing_ok=True)
+                                path = candidate_path
+                                best_size = candidate_size
+                                candidate_path = None
+                        finally:
+                            if candidate_path is not None:
+                                candidate_path.unlink(missing_ok=True)
+                        # Compare a lossless PNG with the highest fitting JPEG
+                        # quality; do not lower quality merely to minimize bytes.
+                        if output_format == "JPEG" and path is not None:
+                            break
+                skip_current_candidate = False
+                if path is not None:
+                    success = True
+                    return str(path)
+                if preserve_dimensions or working.size == (1, 1):
+                    raise ImagePayloadTooLargeError(
+                        f"Image cannot fit the {max_encoded_bytes}-byte encoding limit"
+                    )
+                # One current candidate, replaced on disk; never retain all encodings.
+                target = (
+                    max(1, working.width * 3 // 4),
+                    max(1, working.height * 3 // 4),
+                )
+                if has_alpha:
+                    # Match thumbnail's aspect-ratio rounding. Rounding each
+                    # edge independently can stretch narrow or odd-sized images.
+                    width, height = target
+                    aspect = working.width / working.height
+                    if width / height >= aspect:
+                        width = max(
+                            min(
+                                math.floor(height * aspect),
+                                math.ceil(height * aspect),
+                                key=lambda value: abs(aspect - value / height),
+                            ),
+                            1,
+                        )
+                    else:
+                        height = max(
+                            min(
+                                math.floor(width / aspect),
+                                math.ceil(width / aspect),
+                                key=lambda value: (
+                                    0 if value == 0 else abs(aspect - width / value)
+                                ),
+                            ),
+                            1,
+                        )
+                    target = (width, height)
+                    resized = _resize_alpha_in_strips(working, target)
+                    working.close()
+                    working = converted = resized
+                else:
+                    working.thumbnail(target, PILImage.Resampling.LANCZOS)
         finally:
-            if converted_img is not None:
-                converted_img.close()
+            if converted is not None:
+                converted.close()
+            if not success and path is not None:
+                path.unlink(missing_ok=True)
 
 
 async def compress_image(
     url_or_path: str,
     max_size: int = IMAGE_COMPRESS_DEFAULT_MAX_SIZE,
     quality: int = IMAGE_COMPRESS_DEFAULT_QUALITY,
+    max_encoded_bytes: int = IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES,
+    *,
+    optimize: bool = IMAGE_COMPRESS_DEFAULT_OPTIMIZE,
+    preserve_dimensions: bool = False,
 ) -> str:
-    """Compress large user-uploaded images.
+    """Prepare a local image, preserving compliant bytes.
 
     Args:
-        url_or_path: Image path or URL.
-        max_size: Longest edge of the compressed image in pixels.
-        quality: JPEG output quality in the range 1-100.
+        url_or_path: Local path or inline image; remote URLs remain unresolved.
+        max_size: Maximum edge length when resizing is allowed.
+        quality: Initial JPEG quality.
+        max_encoded_bytes: Maximum base64 payload size.
+        preserve_dimensions: Preserve oriented screenshot dimensions.
 
     Returns:
-        The compressed image path. Returns the original path if compression
-        fails or the source does not need compression.
+        The original reference or a caller-owned prepared file path.
+
+    Raises:
+        ImagePayloadTooLargeError: The image cannot meet the byte limit.
+        OSError: Image decoding or filesystem access fails.
     """
-    max_size = max(int(max_size), 1)
-    quality = min(max(int(quality), 1), 100)
-    optimize = IMAGE_COMPRESS_DEFAULT_OPTIMIZE
-    min_file_size_bytes = int(IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_MB * 1024 * 1024)
-    image_source: bytes | Path | None = None
-
-    def _exceeds_max_size(source: bytes | Path) -> bool:
-        try:
-            fp = io.BytesIO(source) if isinstance(source, bytes) else source
-            with PILImage.open(fp) as opened_img:
-                return max(opened_img.size) > max_size
-        except Exception:  # noqa: BLE001
-            return False
-
-    # Skip compression for remote images and return the original value.
-    if url_or_path.startswith("http"):
+    if url_or_path.startswith(("http://", "https://")):
         return url_or_path
-    elif url_or_path.startswith("data:image"):
-        _header, encoded = url_or_path.split(",", 1)
-        image_source = _decode_base64_payload(
-            encoded,
-            error_message="invalid image data URI payload",
+    if url_or_path.startswith("data:image"):
+        _, encoded = url_or_path.split(",", 1)
+        image_source: bytes | Path = _decode_base64_payload(
+            encoded, error_message="invalid image data URI payload"
         )
-        if len(image_source) < min_file_size_bytes and not _exceeds_max_size(
-            image_source
-        ):
-            return url_or_path
     else:
-        local_path = Path(url_or_path)
-        if not local_path.exists():
+        image_source = Path(url_or_path)
+        if not image_source.exists():
             return url_or_path
-        if local_path.stat().st_size < min_file_size_bytes and not _exceeds_max_size(
-            local_path
-        ):
-            return url_or_path
-        image_source = local_path
 
-    if image_source is None:
-        return url_or_path
-
-    temp_dir = Path(get_astrbot_temp_path())
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Offload the blocking image processing task to a thread.
-    compressed_path = await asyncio.to_thread(
-        _compress_image_sync,
-        image_source,
-        temp_dir,
-        max_size,
-        quality,
-        optimize,
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _compress_image_sync,
+            image_source,
+            Path(get_astrbot_temp_path()),
+            max(int(max_size), 1),
+            min(max(int(quality), 1), 100),
+            optimize,
+            max(int(max_encoded_bytes), 1),
+            preserve_dimensions=preserve_dimensions,
+        )
     )
+    try:
+        compressed_path = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Cancellation cannot stop Pillow in a thread. Retain ownership until
+        # the worker finishes, then release its output without deleting inputs.
+        def cleanup_finished(done: asyncio.Task) -> None:
+            try:
+                output = done.result()
+                if output is not None:
+                    Path(output).unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Cancelled image preparation cleanup failed")
+
+        worker.add_done_callback(cleanup_finished)
+        raise
     return compressed_path or url_or_path
+
+
+async def prepare_image_source(
+    image_ref: MediaRefStr | bytes | ImagePreparationInput,
+    *,
+    options: ImagePreparationOptions | None = None,
+    default_mime_type: str | None = "image/jpeg",
+) -> ResolvedMediaData:
+    """Resolve and prepare any image reference for a provider request.
+
+    Args:
+        image_ref: Local path, HTTP(S) URL, data URI, base64 reference, bare
+            base64 payload, or an ``ImagePreparationInput`` descriptor.
+        options: Optional preparation limits. ``None`` uses the standard budget.
+        default_mime_type: Fallback MIME type for otherwise unidentified images.
+
+    Returns:
+        Provider-ready base64 data and its detected MIME type.
+
+    Raises:
+        ImagePayloadTooLargeError: The image cannot fit the configured budget.
+        OSError: The source cannot be read or decoded.
+        ValueError: The source is not a valid image.
+    """
+    selected = options or ImagePreparationOptions()
+    preparation_input = (
+        image_ref
+        if isinstance(image_ref, ImagePreparationInput)
+        else ImagePreparationInput(image_ref)
+    )
+    source_ref = preparation_input.value
+
+    async def _prepare() -> ResolvedMediaData:
+        owned_source: Path | None = None
+        try:
+            resolved_source = source_ref
+            if isinstance(source_ref, bytes):
+                owned_source = _temp_media_path("image", ".bin")
+                await asyncio.to_thread(owned_source.write_bytes, source_ref)
+                resolved_source = str(owned_source)
+            async with MediaResolver(
+                resolved_source, media_type="image", default_suffix=".bin"
+            ).as_path() as resolved:
+                if not selected.enabled:
+                    source_size = resolved.path.stat().st_size
+                    if (
+                        selected.max_encoded_bytes is not None
+                        and 4 * ((source_size + 2) // 3) > selected.max_encoded_bytes
+                    ):
+                        raise ImagePayloadTooLargeError(
+                            f"Image exceeds the {selected.max_encoded_bytes}-byte encoding limit"
+                        )
+                    mime_type = await detect_image_mime_type_async(
+                        resolved.path, default_mime_type=None
+                    )
+                    if not mime_type:
+                        raise ValueError(
+                            f"Invalid image file: {describe_media_ref(resolved_source)}"
+                        )
+                    image_size = source_size
+                    return ResolvedMediaData(
+                        base64_data=await asyncio.to_thread(
+                            _encode_file_to_base64, resolved.path
+                        ),
+                        mime_type=mime_type,
+                        byte_size=image_size,
+                    )
+                try:
+                    prepared_path = await compress_image(
+                        str(resolved.path),
+                        max_size=selected.max_size,
+                        quality=selected.quality,
+                        max_encoded_bytes=(
+                            selected.max_encoded_bytes
+                            if selected.max_encoded_bytes is not None
+                            else 2**63 - 1
+                        ),
+                        optimize=selected.optimize,
+                        preserve_dimensions=selected.preserve_dimensions,
+                    )
+                except UnidentifiedImageError as exc:
+                    raise ValueError(
+                        f"Invalid image file: {describe_media_ref(source_ref)}"
+                    ) from exc
+                output_path = Path(prepared_path)
+                try:
+                    mime_type = await detect_image_mime_type_async(
+                        output_path, default_mime_type=None
+                    )
+                    image_size = output_path.stat().st_size
+                    encoded_data = await asyncio.to_thread(
+                        _encode_file_to_base64, output_path
+                    )
+                finally:
+                    if output_path != resolved.path:
+                        output_path.unlink(missing_ok=True)
+                if not mime_type:
+                    mime_type = resolved.mime_type or default_mime_type
+                if not mime_type:
+                    raise ValueError(
+                        f"Invalid image file: {describe_media_ref(resolved_source)}"
+                    )
+                return ResolvedMediaData(
+                    base64_data=encoded_data,
+                    mime_type=mime_type,
+                    byte_size=image_size,
+                )
+        finally:
+            if owned_source is not None:
+                owned_source.unlink(missing_ok=True)
+            for cleanup_path in preparation_input.cleanup_paths:
+                cleanup_path.unlink(missing_ok=True)
+
+    worker = asyncio.create_task(_prepare())
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # The worker owns the resolver context until Pillow and file reads exit.
+        worker.add_done_callback(
+            lambda done: done.exception() if not done.cancelled() else None
+        )
+        raise
