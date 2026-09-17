@@ -25,6 +25,7 @@ async def prepare_request_images(
     prepared: dict[str, str | None],
     quote_image_ref: str | None = None,
     montage_max_size: int | None = None,
+    preserve_bytes: bool = False,
 ) -> None:
     """Replace current images on a working request and track their owned files.
 
@@ -38,6 +39,8 @@ async def prepare_request_images(
         prepared: Per-request mapping reused after the request hook.
         quote_image_ref: Optional input for the dedicated quote caption branch.
         montage_max_size: Optional montage-specific limit; defaults to ``max_size``.
+        preserve_bytes: Preserve supported still-image bytes for coordinate-sensitive
+            consumers.
     """
     req.image_urls = normalize_and_dedupe_strings(req.image_urls)
     refs = list(req.image_urls)
@@ -59,6 +62,7 @@ async def prepare_request_images(
                     output_dir=output_dir,
                     quality=quality,
                     montage_max_size=montage_max_size,
+                    preserve_bytes=preserve_bytes,
                 )
                 if path:
                     event.track_temporary_local_file(path)

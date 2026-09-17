@@ -43,11 +43,12 @@ IMAGE_COMPRESS_DEFAULT_MAX_SIZE = 1280
 IMAGE_COMPRESS_DEFAULT_QUALITY = 95
 IMAGE_COMPRESS_DEFAULT_OPTIMIZE = True
 IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_MB = 1.0
-# Model image inputs larger than this are skipped before decoding.
+# Image inputs larger than this are rejected before decoding whenever their
+# encoded size is known.
 MODEL_IMAGE_MAX_INPUT_BYTES = 32 * 1024 * 1024
-# Original encoded bytes are reused only for small stills; larger inputs are
-# re-encoded so the output stays bounded by pixel size and quality.
-MODEL_IMAGE_REUSE_MAX_BYTES = 2 * 1024 * 1024
+IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES = int(
+    IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_MB * 1024 * 1024
+)
 IMAGE_COMPRESS_DEFAULT_MAX_ENCODED_BYTES = 4 * 1024 * 1024
 
 _WEBP_PRESERVE = object()
@@ -356,6 +357,7 @@ def _open_static_webp(
     max_encoded_bytes: int,
     *,
     preserve_dimensions: bool = False,
+    preserve_input: bool = True,
 ):
     """Decode static WebP directly into one caller-owned pixel buffer.
 
@@ -365,6 +367,8 @@ def _open_static_webp(
         max_encoded_bytes: Base64 payload budget.
         preserve_dimensions: Whether the eventual preparation step must retain
             the original dimensions.
+        preserve_input: Whether a compliant static image may be returned
+            without re-encoding.
 
     Returns:
         A Pillow image backed by one RGB/RGBA buffer, ``_WEBP_PRESERVE`` for a
@@ -391,8 +395,10 @@ def _open_static_webp(
                 f"Animated image exceeds the {max_encoded_bytes}-byte encoding limit"
             )
         return _WEBP_PRESERVE
-    if encoded_size <= max_encoded_bytes and (
-        preserve_dimensions or max(width, height) <= max_size
+    if (
+        preserve_input
+        and encoded_size <= max_encoded_bytes
+        and (preserve_dimensions or max(width, height) <= max_size)
     ):
         return _WEBP_PRESERVE
     # The direct route cannot carry EXIF orientation without loading Pillow's
@@ -800,6 +806,124 @@ def _decode_base64_payload(
         raise ValueError(error_message) from exc
 
 
+def _estimate_base64_decoded_size(
+    payload: str,
+    *,
+    start: int = 0,
+    require_valid_chars: bool = False,
+) -> int | None:
+    """Estimate decoded bytes without creating a compact payload copy.
+
+    Args:
+        payload: Base64 text, possibly containing whitespace.
+        start: Index at which the base64 payload begins.
+        require_valid_chars: Whether to reject characters outside standard
+            base64 and whitespace.
+
+    Returns:
+        The estimated decoded byte count, or ``None`` when the text is not a
+        complete standard base64 payload.
+    """
+    encoded_size = 0
+    padding_size = 0
+    for index, char in enumerate(payload):
+        if index < start:
+            continue
+        if char.isspace():
+            continue
+        if require_valid_chars and char not in (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        ):
+            return None
+        encoded_size += 1
+        if char == "=":
+            padding_size += 1
+
+    if encoded_size % 4 == 1:
+        return None
+    return max(0, encoded_size * 3 // 4 - padding_size)
+
+
+def validate_image_input_size(image_source: bytes | str | Path | int) -> int | None:
+    """Reject an image source that is too large to decode safely.
+
+    Args:
+        image_source: Raw bytes, a local path, an image reference, or a known
+            byte count. HTTP(S) references return ``None`` because their size
+            is unknown until download completes.
+
+    Returns:
+        The known encoded byte count, or ``None`` when the source size cannot
+        be determined without reading it.
+
+    Raises:
+        ImagePayloadTooLargeError: The known input exceeds the image input cap.
+        TypeError: The source type is unsupported.
+        OSError: A local file cannot be inspected.
+    """
+    source_size: int | None = None
+    if isinstance(image_source, bool):
+        raise TypeError("Image source size must not be a boolean")
+    if isinstance(image_source, int):
+        source_size = image_source
+    elif isinstance(image_source, bytes):
+        source_size = len(image_source)
+    elif isinstance(image_source, Path):
+        try:
+            source_size = image_source.stat().st_size
+        except FileNotFoundError:
+            return None
+    elif isinstance(image_source, str):
+        if image_source.startswith(("http://", "https://")):
+            return None
+        if image_source.startswith("data:"):
+            comma_index = image_source.find(",")
+            if comma_index < 0:
+                return None
+            header = image_source[:comma_index]
+            header_parts = header[5:].split(";")
+            if any(part.lower() == "base64" for part in header_parts[1:]):
+                source_size = _estimate_base64_decoded_size(
+                    image_source,
+                    start=comma_index + 1,
+                )
+        elif image_source.startswith("base64://"):
+            source_size = _estimate_base64_decoded_size(
+                image_source,
+                start=len("base64://"),
+            )
+        else:
+            is_uri = is_file_uri(image_source)
+            if is_uri:
+                try:
+                    source_size = Path(file_uri_to_path(image_source)).stat().st_size
+                except FileNotFoundError:
+                    source_size = None
+            else:
+                try:
+                    source_size = Path(image_source).stat().st_size
+                except (FileNotFoundError, OSError, ValueError):
+                    source_size = None
+            if source_size is None and not is_uri:
+                source_size = _estimate_base64_decoded_size(
+                    image_source,
+                    require_valid_chars=True,
+                )
+    else:
+        raise TypeError(f"Unsupported image source type: {type(image_source).__name__}")
+
+    if source_size is None:
+        return None
+    if source_size < 0:
+        raise ValueError("Image source size must not be negative")
+    if source_size > MODEL_IMAGE_MAX_INPUT_BYTES:
+        raise ImagePayloadTooLargeError(
+            "Image input exceeds the "
+            f"{MODEL_IMAGE_MAX_INPUT_BYTES}-byte limit ({source_size} bytes)"
+        )
+    return source_size
+
+
 def _encode_file_to_base64(path: Path) -> str:
     """Encode a file without retaining a second full raw-image copy.
 
@@ -995,6 +1119,8 @@ async def _materialize_media_ref(
         cleanup_paths.append(target_path)
         try:
             await download_file(media_ref, str(target_path))
+            if media_type == "image":
+                validate_image_input_size(target_path)
         except Exception:
             _cleanup_paths(cleanup_paths)
             raise
@@ -1020,9 +1146,13 @@ async def _materialize_media_ref(
 
     if is_file_uri(media_ref):
         path = Path(file_uri_to_path(media_ref))
+        if media_type == "image":
+            validate_image_input_size(path)
         return _LocalMediaFile(path=path, mime_type=_guess_mime_type(path))
 
     if media_ref.startswith("data:"):
+        if media_type == "image":
+            validate_image_input_size(media_ref)
         mime_type, media_bytes = _parse_base64_data_uri(media_ref)
         target_suffix = _extension_from_mime_type(mime_type) or suffix
         if media_type == "image" and target_suffix == suffix:
@@ -1047,6 +1177,8 @@ async def _materialize_media_ref(
         )
 
     if media_ref.startswith("base64://"):
+        if media_type == "image":
+            validate_image_input_size(media_ref)
         media_bytes = _decode_base64_payload(
             media_ref.removeprefix("base64://"),
             error_message="invalid base64 media payload",
@@ -1079,8 +1211,12 @@ async def _materialize_media_ref(
     except OSError:
         pass
     if path_exists:
+        if media_type == "image":
+            validate_image_input_size(path)
         return _LocalMediaFile(path=path, mime_type=_guess_mime_type(path))
 
+    if media_type == "image":
+        validate_image_input_size(media_ref)
     compact_media_ref = "".join(media_ref.split())
     if compact_media_ref:
         try:
@@ -1795,7 +1931,11 @@ def _publish_image_cache_atomic(
 
 
 def _convert_image_bytes_sync(
-    source_bytes: bytes, max_size: int, quality: int
+    source_bytes: bytes,
+    max_size: int,
+    quality: int,
+    *,
+    preserve_bytes: bool = False,
 ) -> bytes:
     """Normalize a validated still image with an optional derived cache.
 
@@ -1803,17 +1943,23 @@ def _convert_image_bytes_sync(
         source_bytes: Encoded source bytes already checked by _inspect_image.
         max_size: Longest-edge limit in pixels.
         quality: JPEG output quality in the range 1-100.
+        preserve_bytes: Keep a supported, correctly oriented still byte-exact
+            even when it exceeds the normal small-source threshold.
 
     Returns:
         Single-frame JPEG or PNG bytes. An oriented JPEG or PNG within the size
-        and reuse-byte limits is reused unchanged; anything else is re-encoded.
+        and small-source limit is reused unchanged; anything else is re-encoded.
     """
+    validate_image_input_size(source_bytes)
     with PILImage.open(io.BytesIO(source_bytes)) as image:
         if (
             image.format in {"PNG", "JPEG"}
             and image.getexif().get(274, 1) == 1
             and max(image.size) <= max_size
-            and len(source_bytes) <= MODEL_IMAGE_REUSE_MAX_BYTES
+            and (
+                preserve_bytes
+                or len(source_bytes) <= IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES
+            )
         ):
             return source_bytes
         cache_key = _image_convert_cache_key(
@@ -1939,6 +2085,7 @@ async def prepare_model_image(
     output_dir: Path,
     quality: int = IMAGE_COMPRESS_DEFAULT_QUALITY,
     montage_max_size: int | None = None,
+    preserve_bytes: bool = False,
 ) -> str | None:
     """Prepare a single local model-ready image for the caller to own until consumption.
 
@@ -1952,6 +2099,8 @@ async def prepare_model_image(
             but montages are never used for coordinates, so callers pass the
             configured limit here to keep the 3x3 canvas bounded. Defaults to
             ``max_size``.
+        preserve_bytes: Preserve supported, correctly oriented still-image bytes
+            for coordinate-sensitive consumers such as CUA.
 
     Returns:
         An existing JPEG or PNG path, or None for a recoverable input or write
@@ -1960,14 +2109,6 @@ async def prepare_model_image(
     """
     try:
         async with MediaResolver(image_ref, media_type="image").as_path() as source:
-            input_size = source.path.stat().st_size
-            if input_size > MODEL_IMAGE_MAX_INPUT_BYTES:
-                logger.warning(
-                    "Skipping oversized image input (%d bytes): %s",
-                    input_size,
-                    source.path,
-                )
-                return None
             image_bytes = await asyncio.to_thread(source.read_bytes)
         frame_count = await asyncio.to_thread(_inspect_image, image_bytes)
         if frame_count > 1:
@@ -1979,7 +2120,11 @@ async def prepare_model_image(
             )
         else:
             converted_bytes = await asyncio.to_thread(
-                _convert_image_bytes_sync, image_bytes, max_size, quality
+                _convert_image_bytes_sync,
+                image_bytes,
+                max_size,
+                quality,
+                preserve_bytes=preserve_bytes,
             )
         # Publish the working file synchronously after encoding, so cancellation
         # cannot leave an untracked background write alive after this call.
@@ -2674,7 +2819,12 @@ def _compress_image_sync(
     """
     if max_size < 1 or max_encoded_bytes < 1 or not 1 <= quality <= 100:
         raise ValueError("Image dimensions, byte budget and quality must be positive")
-    source_bytes = len(source) if isinstance(source, bytes) else source.stat().st_size
+    if isinstance(source, bytes):
+        source_bytes = len(source)
+    else:
+        source_bytes = validate_image_input_size(source)
+        if source_bytes is None:
+            source_bytes = source.stat().st_size
     encoded_size = 4 * ((source_bytes + 2) // 3)
     direct_webp = None
     if isinstance(source, bytes):
@@ -2691,6 +2841,7 @@ def _compress_image_sync(
             max_size,
             max_encoded_bytes,
             preserve_dimensions=preserve_dimensions,
+            preserve_input=source_bytes <= IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES,
         )
         if direct_webp is _WEBP_PRESERVE:
             return None
@@ -2705,8 +2856,10 @@ def _compress_image_sync(
                     f"Animated image exceeds the {max_encoded_bytes}-byte encoding limit"
                 )
             return None
-        if encoded_size <= max_encoded_bytes and (
-            preserve_dimensions or max(opened.size) <= max_size
+        if (
+            source_bytes <= IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES
+            and encoded_size <= max_encoded_bytes
+            and (preserve_dimensions or max(opened.size) <= max_size)
         ):
             return None
 
@@ -2877,25 +3030,52 @@ async def compress_image(
     """
     if url_or_path.startswith(("http://", "https://")):
         return url_or_path
+    max_size = max(int(max_size), 1)
+    quality = min(max(int(quality), 1), 100)
+    max_encoded_bytes = max(int(max_encoded_bytes), 1)
+    image_source: bytes | Path
+    source_size: int
+
+    def _fits_max_size(source: bytes | Path) -> bool | None:
+        try:
+            image_file = io.BytesIO(source) if isinstance(source, bytes) else source
+            with PILImage.open(image_file) as opened_image:
+                return max(opened_image.size) <= max_size
+        except MemoryError:
+            raise
+        except Exception:
+            return None
+
     if url_or_path.startswith("data:image"):
+        validate_image_input_size(url_or_path)
         _, encoded = url_or_path.split(",", 1)
         image_source: bytes | Path = _decode_base64_payload(
             encoded, error_message="invalid image data URI payload"
         )
+        source_size = len(image_source)
     else:
         image_source = Path(url_or_path)
-        if not image_source.exists():
+        source_size = validate_image_input_size(image_source)
+        if source_size is None:
             return url_or_path
+
+    encoded_size = 4 * ((source_size + 2) // 3)
+    if (
+        source_size < IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES
+        and encoded_size <= max_encoded_bytes
+        and _fits_max_size(image_source)
+    ):
+        return url_or_path
 
     worker = asyncio.create_task(
         asyncio.to_thread(
             _compress_image_sync,
             image_source,
             Path(get_astrbot_temp_path()),
-            max(int(max_size), 1),
-            min(max(int(quality), 1), 100),
+            max_size,
+            quality,
             optimize,
-            max(int(max_encoded_bytes), 1),
+            max_encoded_bytes,
             preserve_dimensions=preserve_dimensions,
         )
     )
@@ -2952,6 +3132,7 @@ async def prepare_image_source(
         try:
             resolved_source = source_ref
             if isinstance(source_ref, bytes):
+                validate_image_input_size(source_ref)
                 owned_source = _temp_media_path("image", ".bin")
                 await asyncio.to_thread(owned_source.write_bytes, source_ref)
                 resolved_source = str(owned_source)
@@ -3011,8 +3192,15 @@ async def prepare_image_source(
                 finally:
                     if output_path != resolved.path:
                         output_path.unlink(missing_ok=True)
+                if mime_type == "application/octet-stream":
+                    mime_type = None
+                if mime_type is None and resolved.mime_type not in {
+                    None,
+                    "application/octet-stream",
+                }:
+                    mime_type = resolved.mime_type
                 if not mime_type:
-                    mime_type = resolved.mime_type or default_mime_type
+                    mime_type = default_mime_type
                 if not mime_type:
                     raise ValueError(
                         f"Invalid image file: {describe_media_ref(resolved_source)}"

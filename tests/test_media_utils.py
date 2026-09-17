@@ -325,6 +325,34 @@ async def test_compress_image_preserves_alpha_png(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_compress_image_reencodes_sources_over_one_megabyte(
+    tmp_path, monkeypatch
+):
+    """Sources above the legacy threshold still enter the compression path."""
+    from PIL import Image as PILImage
+
+    temp_dir = tmp_path / "temp"
+    monkeypatch.setattr(media_utils, "get_astrbot_temp_path", lambda: str(temp_dir))
+    image_path = tmp_path / "large.png"
+    with PILImage.frombytes("RGB", (768, 768), os.urandom(768 * 768 * 3)) as image:
+        image.save(image_path, format="PNG")
+
+    assert (
+        image_path.stat().st_size
+        > media_utils.IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES
+    )
+    compressed_path = Path(await media_utils.compress_image(str(image_path)))
+
+    try:
+        assert compressed_path != image_path
+        assert compressed_path.suffix == ".jpg"
+        assert compressed_path.read_bytes().startswith(b"\xff\xd8")
+        assert image_path.read_bytes().startswith(b"\x89PNG")
+    finally:
+        compressed_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_compress_image_rejects_oversized_encoded_payload(tmp_path, monkeypatch):
     from PIL import Image as PILImage
 
@@ -910,11 +938,33 @@ async def test_prepare_model_image_skips_oversized_input(tmp_path, monkeypatch):
     with image_path.open("ab") as f:
         f.truncate(media_utils.MODEL_IMAGE_MAX_INPUT_BYTES + 1)
 
+    def fail_read(*_args, **_kwargs):
+        raise AssertionError("oversized image must be rejected before reading")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+
     result = await media_utils.prepare_model_image(
         str(image_path), max_size=1280, output_dir=tmp_path
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_image_source_rejects_oversized_data_uri_before_decode(
+    monkeypatch,
+):
+    """Inline payloads must be bounded before base64 decoding allocates bytes."""
+    monkeypatch.setattr(media_utils, "MODEL_IMAGE_MAX_INPUT_BYTES", 4)
+
+    def fail_decode(*_args, **_kwargs):
+        raise AssertionError("oversized data URI must not be decoded")
+
+    monkeypatch.setattr(media_utils, "_decode_base64_payload", fail_decode)
+    image_ref = "data:image/png;base64," + base64.b64encode(b"12345").decode()
+
+    with pytest.raises(media_utils.ImagePayloadTooLargeError, match="input exceeds"):
+        await media_utils.prepare_image_source(image_ref)
 
 
 def test_convert_image_bytes_reuses_small_in_range_input():
@@ -940,7 +990,7 @@ def test_convert_image_bytes_reencodes_large_in_range_input(tmp_path, monkeypatc
     buffer = BytesIO()
     img.save(buffer, format="PNG")
     source = buffer.getvalue()
-    assert len(source) > media_utils.MODEL_IMAGE_REUSE_MAX_BYTES
+    assert len(source) > media_utils.IMAGE_COMPRESS_DEFAULT_MIN_FILE_SIZE_BYTES
 
     result = media_utils._convert_image_bytes_sync(source, 1280, 95)
 

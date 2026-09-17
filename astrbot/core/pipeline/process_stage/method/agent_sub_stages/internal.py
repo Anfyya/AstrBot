@@ -294,6 +294,7 @@ class InternalAgentSubStage(Stage):
                         prepared=prepared,
                         quote_image_ref=quote_image_ref,
                         montage_max_size=montage_max_size,
+                        preserve_bytes=cua_pixel_mode,
                     )
                     await _process_quote_message(
                         event,
@@ -361,6 +362,7 @@ class InternalAgentSubStage(Stage):
                         output_dir=output_dir,
                         prepared=prepared,
                         montage_max_size=montage_max_size,
+                        preserve_bytes=cua_pixel_mode,
                     )
                     if cua_pixel_mode:
                         oversized = []
